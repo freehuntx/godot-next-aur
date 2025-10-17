@@ -1,0 +1,192 @@
+name: Update Godot Next Package
+
+# Run daily, manual or on push
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily check
+  workflow_dispatch:  # Manual trigger
+  push:
+    branches:
+      - godot-next-bin
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Check for new Godot beta/dev
+        id: check
+        run: |
+          set -euo pipefail  # Exit immediately if any command fails
+          ls -lah
+
+          # Fetch releases (prereleases included)
+          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/godotengine/godot-builds/releases)
+
+          # Check if response is an array (starts with [), otherwise print error and exit
+          if [[ "$RESPONSE" != \[* ]]; then
+            echo "Error fetching releases: $RESPONSE"
+            exit 1
+          fi
+
+          # Collect candidate tags that contain dev or beta
+          CANDIDATES=$(echo "$RESPONSE" | jq -r '.[] | .tag_name' | grep -E -i -- "-(dev|beta)" || true)
+
+          if [ -z "$CANDIDATES" ]; then
+            echo "No dev/beta releases found"
+            exit 1
+          fi
+
+          # Choose the semantically latest prerelease among dev/beta tags.
+          # Rules (reasonable assumptions):
+          # 1) Compare numeric base version: major, minor, patch (missing patch -> 0)
+          # 2) For same base version, prefer beta over dev (beta is closer to release)
+          # 3) For same prerelease type, pick the highest prerelease number
+          best_tag=""
+          best_key=""
+
+          while IFS= read -r tag; do
+            # normalize tag (leave as-is for output)
+            t="$tag"
+
+            # regex to capture v?MAJOR(.MINOR)?(.PATCH)?-TYPE(NUM)
+            if [[ $t =~ ^v?([0-9]+)(\.([0-9]+))?(\.([0-9]+))?-(dev|beta)([0-9]*)$ ]]; then
+              major=${BASH_REMATCH[1]}
+              minor=${BASH_REMATCH[3]:-0}
+              patch=${BASH_REMATCH[5]:-0}
+              pre_type=${BASH_REMATCH[6]}
+              pre_num=${BASH_REMATCH[7]:-0}
+            else
+              # If the tag doesn't match expected pattern, try a relaxed parse
+              # fallback: treat as very low priority
+              major=0; minor=0; patch=0; pre_type=dev; pre_num=0
+            fi
+
+            if [ "${pre_type,,}" = "beta" ]; then
+              pre_weight=2
+            else
+              pre_weight=1
+            fi
+
+            # Build a fixed-width numeric key for string comparison:
+            # 4 digits for major/minor/patch, 2 digits for pre_weight, 4 digits for pre_num
+            key=$(printf "%04d%04d%04d%02d%04d" $major $minor $patch $pre_weight $pre_num)
+
+            if [[ -z "$best_key" || "$key" > "$best_key" ]]; then
+              best_key="$key"
+              best_tag="$t"
+            fi
+          done <<< "$CANDIDATES"
+
+          if [ -z "$best_tag" ]; then
+            echo "No suitable dev/beta tag parsed"
+            exit 1
+          fi
+
+          LATEST="$best_tag"
+          echo "Latest prerelease tag: $LATEST"
+          echo "LATEST_VERSION=$LATEST" >> $GITHUB_ENV
+
+          # Convert tag to a pkgver-like string (strip hyphen and leading 'v')
+          VERSION=$(echo $LATEST | sed 's/-//g' | sed 's/^v//')
+          CURRENT_VERSION=$(grep '^pkgver=' PKGBUILD | cut -d'=' -f2)
+          echo "latest_version=$VERSION" >> $GITHUB_OUTPUT
+          echo "latest_tag=$LATEST" >> $GITHUB_OUTPUT
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+          # Check if update is needed
+          if [ "$VERSION" != "$CURRENT_VERSION" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate PKGBUILD from template
+        if: success() && steps.check.outputs.needs_update == 'true'
+        run: |
+          ls -lah
+          VERSION="${{ steps.check.outputs.latest_version }}"
+          TAG="${{ steps.check.outputs.latest_tag }}"
+          MAJOR_VERSION=$(echo "$VERSION" | cut -d'.' -f1-2)
+          
+          # Generate PKGBUILD from template
+          cp PKGBUILD.template PKGBUILD
+          sed -i "s/{{VERSION}}/$VERSION/g" PKGBUILD
+          sed -i "s/{{TAG}}/$TAG/g" PKGBUILD
+          sed -i "s/{{MAJOR_VERSION}}/$MAJOR_VERSION/g" PKGBUILD
+          echo "PKGBUILD generated for Godot $VERSION"
+          cat PKGBUILD
+
+      - name: Generate .SRCINFO
+        if: success() && steps.check.outputs.needs_update == 'true'
+        uses: heyhusen/archlinux-package-action@v2
+        with:
+          path: . # This makes sure all files in the current directory are included
+          srcinfo: true
+
+      - name: Commit changes
+        if: success() && steps.check.outputs.needs_update == 'true'
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to Godot ${{ steps.check.outputs.latest_version }}" || echo "No changes"
+
+      - name: Push to GitHub
+        if: success() && steps.check.outputs.needs_update == 'true'
+        run: git push
+
+      - name: Setup SSH for AUR
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          
+          # Add AUR host to known_hosts
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+          
+          # Configure git to use SSH key for AUR
+          git config --global url."ssh://aur@aur.archlinux.org/".insteadOf "https://aur.archlinux.org/"
+
+      - name: Push to AUR
+        if: success() && steps.check.outputs.needs_update == 'true'
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          # Setup git
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+    
+          # Clone AUR repo using SSH key
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key -o StrictHostKeyChecking=no" \
+          git clone ssh://aur@aur.archlinux.org/godot-next-bin aur-repo
+    
+          cd aur-repo
+
+          # Copy only AUR-required files from your repo root
+          cp ../PKGBUILD .
+          cp ../.SRCINFO .
+          cp ../.gitignore . 2>/dev/null || true
+    
+          # Copy any patch files if they exist
+          cp ../*.patch . 2>/dev/null || true
+          cp ../*.diff . 2>/dev/null || true
+    
+          # Check if there are changes
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes to push"
+            exit 0
+          fi
+
+          # Commit and push with SSH key
+          git add .
+          git commit -m "Update from GitHub: $(date)"
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key -o StrictHostKeyChecking=no" \
+          git push origin master
