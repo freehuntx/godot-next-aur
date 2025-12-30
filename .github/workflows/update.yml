@@ -143,50 +143,65 @@ jobs:
         if: success() && steps.check.outputs.needs_update == 'true'
         run: git push
 
-      - name: Setup SSH for AUR
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur_key
-          chmod 600 ~/.ssh/aur_key
-          
-          # Add AUR host to known_hosts
-          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
-          
-          # Configure git to use SSH key for AUR
-          git config --global url."ssh://aur@aur.archlinux.org/".insteadOf "https://aur.archlinux.org/"
-
-      - name: Push to AUR
+      - name: Build package
         if: success() && steps.check.outputs.needs_update == 'true'
-        env:
-          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
-        run: |
-          # Setup git
-          git config --global user.name "GitHub Action"
-          git config --global user.email "action@github.com"
-    
-          # Clone AUR repo using SSH key
-          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key -o StrictHostKeyChecking=no" \
-          git clone ssh://aur@aur.archlinux.org/godot-next-bin aur-repo
-    
-          cd aur-repo
+        uses: docker://archlinux:base-devel
+        with:
+          entrypoint: /bin/bash
+          args: >-
+            -c "export OWNER=$(stat -c '%u:%g' .) && pacman -Sy --noconfirm && useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers && chown -R builder . && su builder -c 'makepkg -s --noconfirm' && chown -R $OWNER ."
 
-          # Copy only AUR-required files from your repo root
-          cp ../PKGBUILD .
-          cp ../.SRCINFO .
-          cp ../.gitignore . 2>/dev/null || true
-    
-          # Copy any patch files if they exist
-          cp ../*.patch . 2>/dev/null || true
-          cp ../*.diff . 2>/dev/null || true
-    
-          # Check if there are changes
-          if git diff --quiet && git diff --cached --quiet; then
-            echo "No changes to push"
-            exit 0
+      - name: Verify Build
+        if: success() && steps.check.outputs.needs_update == 'true'
+        run: ls -lah
+
+      - name: Prepare Repository
+        if: success() && steps.check.outputs.needs_update == 'true'
+        run: |
+          # Debug: List files to find the package
+          echo "Listing files in workspace:"
+          ls -R
+
+          # Clone the repository to repo_dir
+          git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git repo_dir
+          
+          cd repo_dir
+          # Try to checkout gh-pages, if not exist, create orphan
+          if git fetch origin gh-pages && git checkout gh-pages; then
+            echo "Checked out existing gh-pages branch"
+          else
+            echo "Creating new gh-pages branch"
+            git checkout --orphan gh-pages
+            git rm -rf .
+          fi
+          cd ..
+          
+          # Create architecture directory
+          mkdir -p repo_dir/x86_64
+          
+          # Copy package files (handle potential subdirectories or missing files)
+          # Find .pkg.tar.zst files and copy them
+          find . -maxdepth 2 -name "*.pkg.tar.zst" -exec cp {} repo_dir/x86_64/ \;
+          
+          # Verify copy
+          if [ -z "$(ls -A repo_dir/x86_64/*.pkg.tar.zst 2>/dev/null)" ]; then
+            echo "Error: No package file found to copy!"
+            exit 1
           fi
 
-          # Commit and push with SSH key
-          git add .
-          git commit -m "Update from GitHub: $(date)"
-          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key -o StrictHostKeyChecking=no" \
-          git push origin master
+      - name: Update Repo Database
+        if: success() && steps.check.outputs.needs_update == 'true'
+        uses: docker://archlinux:base-devel
+        with:
+          entrypoint: /bin/bash
+          args: -c "cd repo_dir/x86_64 && repo-add -n -R godot-next.db.tar.gz *.pkg.tar.zst"
+
+      - name: Deploy to gh-pages
+        if: success() && steps.check.outputs.needs_update == 'true'
+        working-directory: repo_dir
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add x86_64
+          git commit -m "Update repository: $(date)"
+          git push origin gh-pages
